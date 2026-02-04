@@ -1,3 +1,7 @@
-# SAGE
+# SAGE: Self-Hinting Language Models Enhance Reinforcement Learning
 
-This is the official repos for Self-Hinting Language Models for Reinforcement Learning. The code will be released within this week.
+
+<img src="assets/hint.png" width="640" height="250" alt="SAGE hinting overview">
+
+This is the official repos. The code will be released within this week.
+
