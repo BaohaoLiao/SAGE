@@ -10,6 +10,8 @@ model_name="Qwen2.5-7B-Instruct"
 
 # SAGE method
 method="sage" # or "sage-light" for faster but slightly worse performance
+hint_accuracy_min_threshold=0.0  # Only work for sage-light: When the accuracy of a prompt from previous epoch is lower than this threshold (hard), the hint level increases by 1.
+hint_accuracy_max_threshold=0.35  # Only work for sage-light When the accuracy of a prompt from previous epoch is larger than this threshold (easy), the hint level decreases by 1.
 
 # Wandb setting
 project_name="SAGE"
