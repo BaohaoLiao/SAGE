@@ -22,291 +22,49 @@ import json
 import json5
 import os
 import uuid
-from collections import defaultdict
 from copy import deepcopy
-from dataclasses import dataclass, field
 from pprint import pprint
 from typing import Any, Optional
 
 import numpy as np
 import ray
 import torch
-from omegaconf import OmegaConf, open_dict
 from torch.utils.data import Dataset, Sampler
-from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
 
 from verl import DataProto
 from verl.experimental.dataset.sampler import AbstractCurriculumSampler
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
-from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, RayWorkerGroup
-from verl.single_controller.ray.base import create_colocated_worker_cls
-from verl.trainer.config import AlgoConfig
-from verl.trainer.ppo import core_algos
+from verl.single_controller.ray import RayWorkerGroup
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
-from verl.trainer.ppo.metric_utils import (
-    compute_data_metrics,
-    compute_throughout_metrics,
-    compute_timing_metrics,
-    process_validation_metrics,
-)
-from verl.trainer.ppo.mismatch_helper import compute_rollout_importance_weights
+from verl.trainer.ppo.metric_utils import compute_data_metrics, compute_throughout_metrics, compute_timing_metrics
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async
-from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy, need_reward_model
+from verl.trainer.ppo.ray_trainer import (
+    RayPPOTrainer,
+    ResourcePoolManager,
+    apply_kl_penalty,
+    compute_advantage,
+    compute_response_mask,
+)
+from verl.trainer.ppo.utils import Role, WorkerType
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
-from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
 from verl.utils.metric import reduce_metrics
 from verl.utils.rollout_skip import RolloutSkip
-from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
-from verl.utils.torch_functional import masked_mean, postprocess_data
-from verl.utils.tracking import ValidationGenerationsLogger
+from verl.utils.torch_functional import postprocess_data
 from verl.utils.model import compute_position_id_with_mask
 
 from recipe.hint.reward_tracker import RewardTracker
-
-HINT_SYSTEM_PROMPT = """You are a tutoring assistant that generates progressive hints to help students solve difficult problems without revealing the solution directly.
-
-TASK:
-Given a question and its solution, generate 3 levels of hints that progressively guide the student toward solving the problem independently.
-
-HINT LEVELS:
-- Level 1: Minimal hint - Points to the key concept or approach without specifics
-- Level 2: Medium hint - Provides more direction on the method or intermediate steps
-- Level 3: Detailed hint - Gives substantial guidance while still requiring the student to complete the solution
-
-GUIDELINES:
-- Never reveal the final answer
-- Hints should inspire problem-solving, not just provide steps to copy
-- Tailor hint difficulty to bridge the gap between the student's level and the solution
-
-OUTPUT FORMAT:
-```json
-{
-    "level_1": "minimal hint text",
-    "level_2": "medium hint text",
-    "level_3": "detailed hint text"
-}
-```"""
-
-HINT_USER_PROMPT_TEMPLATE = """Question: 
-{problem}
-
-Solution:
-{solution}
-"""
-
-ANSWER_SYSTEM_PROMPT = "Please reason step by step, and put your final answer within \\boxed{}."
+from recipe.hint.prompt import ANSWER_SYSTEM_PROMPT, HINT_SYSTEM_PROMPT, HINT_USER_PROMPT_TEMPLATE
 
 
-@dataclass
-class ResourcePoolManager:
-    """
-    Define a resource pool specification. Resource pool will be initialized first.
-    """
-
-    resource_pool_spec: dict[str, list[int]]
-    mapping: dict[Role, str]
-    resource_pool_dict: dict[str, RayResourcePool] = field(default_factory=dict)
-
-    def create_resource_pool(self):
-        """Create Ray resource pools for distributed training.
-
-        Initializes resource pools based on the resource pool specification,
-        with each pool managing GPU resources across multiple nodes.
-        For FSDP backend, uses max_colocate_count=1 to merge WorkerGroups.
-        For Megatron backend, uses max_colocate_count>1 for different models.
-        """
-        for resource_pool_name, process_on_nodes in self.resource_pool_spec.items():
-            # max_colocate_count means the number of WorkerGroups (i.e. processes) in each RayResourcePool
-            # For FSDP backend, we recommend using max_colocate_count=1 that merge all WorkerGroups into one.
-            # For Megatron backend, we recommend using max_colocate_count>1
-            # that can utilize different WorkerGroup for differnt models
-            resource_pool = RayResourcePool(
-                process_on_nodes=process_on_nodes, use_gpu=True, max_colocate_count=1, name_prefix=resource_pool_name
-            )
-            self.resource_pool_dict[resource_pool_name] = resource_pool
-
-        self._check_resource_available()
-
-    def get_resource_pool(self, role: Role) -> RayResourcePool:
-        """Get the resource pool of the worker_cls"""
-        return self.resource_pool_dict[self.mapping[role]]
-
-    def get_n_gpus(self) -> int:
-        """Get the number of gpus in this cluster."""
-        return sum([n_gpus for process_on_nodes in self.resource_pool_spec.values() for n_gpus in process_on_nodes])
-
-    def _check_resource_available(self):
-        """Check if the resource pool can be satisfied in this ray cluster."""
-        node_available_resources = ray._private.state.available_resources_per_node()
-        node_available_gpus = {
-            node: node_info.get("GPU", 0) if "GPU" in node_info else node_info.get("NPU", 0)
-            for node, node_info in node_available_resources.items()
-        }
-
-        # check total required gpus can be satisfied
-        total_available_gpus = sum(node_available_gpus.values())
-        total_required_gpus = sum(
-            [n_gpus for process_on_nodes in self.resource_pool_spec.values() for n_gpus in process_on_nodes]
-        )
-        if total_available_gpus < total_required_gpus:
-            raise ValueError(
-                f"Total available GPUs {total_available_gpus} is less than total desired GPUs {total_required_gpus}"
-            )
-        
-
-def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl"):
-    """Apply KL penalty to the token-level rewards.
-
-    This function computes the KL divergence between the reference policy and current policy,
-    then applies a penalty to the token-level rewards based on this divergence.
-
-    Args:
-        data (DataProto): The data containing batched model outputs and inputs.
-        kl_ctrl (core_algos.AdaptiveKLController): Controller for adaptive KL penalty.
-        kl_penalty (str, optional): Type of KL penalty to apply. Defaults to "kl".
-
-    Returns:
-        tuple: A tuple containing:
-            - The updated data with token-level rewards adjusted by KL penalty
-            - A dictionary of metrics related to the KL penalty
-    """
-    response_mask = data.batch["response_mask"]
-    token_level_scores = data.batch["token_level_scores"]
-    batch_size = data.batch.batch_size[0]
-
-    # compute kl between ref_policy and current policy
-    # When apply_kl_penalty, algorithm.use_kl_in_reward=True, so the reference model has been enabled.
-    kld = core_algos.kl_penalty(
-        data.batch["old_log_probs"], data.batch["ref_log_prob"], kl_penalty=kl_penalty
-    )  # (batch_size, response_length)
-    kld = kld * response_mask
-    beta = kl_ctrl.value
-
-    token_level_rewards = token_level_scores - beta * kld
-
-    current_kl = masked_mean(kld, mask=response_mask, axis=-1)  # average over sequence
-    current_kl = torch.mean(current_kl, dim=0).item()
-
-    # according to https://github.com/huggingface/trl/blob/951ca1841f29114b969b57b26c7d3e80a39f75a0/trl/trainer/ppo_trainer.py#L837
-    kl_ctrl.update(current_kl=current_kl, n_steps=batch_size)
-    data.batch["token_level_rewards"] = token_level_rewards
-
-    metrics = {"actor/reward_kl_penalty": current_kl, "actor/reward_kl_penalty_coeff": beta}
-
-    return data, metrics
-
-
-def compute_response_mask(data: DataProto):
-    """Compute the attention mask for the response part of the sequence.
-
-    This function extracts the portion of the attention mask that corresponds to the model's response,
-    which is used for masking computations that should only apply to response tokens.
-
-    Args:
-        data (DataProto): The data containing batched model outputs and inputs.
-
-    Returns:
-        torch.Tensor: The attention mask for the response tokens.
-    """
-    responses = data.batch["responses"]
-    response_length = responses.size(1)
-    attention_mask = data.batch["attention_mask"]
-    return attention_mask[:, -response_length:]
-
-
-def compute_advantage(
-    data: DataProto,
-    adv_estimator: AdvantageEstimator,
-    gamma: float = 1.0,
-    lam: float = 1.0,
-    num_repeat: int = 1,
-    norm_adv_by_std_in_grpo: bool = True,
-    config: Optional[AlgoConfig] = None,
-) -> DataProto:
-    """Compute advantage estimates for policy optimization.
-
-    This function computes advantage estimates using various estimators like GAE, GRPO, REINFORCE++, etc.
-    The advantage estimates are used to guide policy optimization in RL algorithms.
-
-    Args:
-        data (DataProto): The data containing batched model outputs and inputs.
-        adv_estimator (AdvantageEstimator): The advantage estimator to use (e.g., GAE, GRPO, REINFORCE++).
-        gamma (float, optional): Discount factor for future rewards. Defaults to 1.0.
-        lam (float, optional): Lambda parameter for GAE. Defaults to 1.0.
-        num_repeat (int, optional): Number of times to repeat the computation. Defaults to 1.
-        norm_adv_by_std_in_grpo (bool, optional): Whether to normalize advantages by standard deviation in
-            GRPO. Defaults to True.
-        config (dict, optional): Configuration dictionary for algorithm settings. Defaults to None.
-
-    Returns:
-        DataProto: The updated data with computed advantages and returns.
-    """
-    # Back-compatible with trainers that do not compute response mask in fit
-    if "response_mask" not in data.batch.keys():
-        data.batch["response_mask"] = compute_response_mask(data)
-    # prepare response group
-    if adv_estimator == AdvantageEstimator.GAE:
-        # Compute advantages and returns using Generalized Advantage Estimation (GAE)
-        advantages, returns = core_algos.compute_gae_advantage_return(
-            token_level_rewards=data.batch["token_level_rewards"],
-            values=data.batch["values"],
-            response_mask=data.batch["response_mask"],
-            gamma=gamma,
-            lam=lam,
-        )
-        data.batch["advantages"] = advantages
-        data.batch["returns"] = returns
-        if config.get("use_pf_ppo", False):
-            data = core_algos.compute_pf_ppo_reweight_data(
-                data,
-                config.pf_ppo.get("reweight_method"),
-                config.pf_ppo.get("weight_pow"),
-            )
-    elif adv_estimator == AdvantageEstimator.GRPO:
-        # Initialize the mask for GRPO calculation
-        grpo_calculation_mask = data.batch["response_mask"]
-
-        # Call compute_grpo_outcome_advantage with parameters matching its definition
-        advantages, returns = core_algos.compute_grpo_outcome_advantage(
-            token_level_rewards=data.batch["token_level_rewards"],
-            response_mask=grpo_calculation_mask,
-            index=data.non_tensor_batch["uid"],
-            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-        )
-        data.batch["advantages"] = advantages
-        data.batch["returns"] = returns
-    else:
-        # handle all other adv estimator type other than GAE and GRPO
-        adv_estimator_fn = core_algos.get_adv_estimator_fn(adv_estimator)
-        adv_kwargs = {
-            "token_level_rewards": data.batch["token_level_rewards"],
-            "response_mask": data.batch["response_mask"],
-            "config": config,
-        }
-        if "uid" in data.non_tensor_batch:  # optional
-            adv_kwargs["index"] = data.non_tensor_batch["uid"]
-        if "reward_baselines" in data.batch:  # optional
-            adv_kwargs["reward_baselines"] = data.batch["reward_baselines"]
-
-        # calculate advantage estimator
-        advantages, returns = adv_estimator_fn(**adv_kwargs)
-        data.batch["advantages"] = advantages
-        data.batch["returns"] = returns
-    return data
-
-
-class RayHintTrainer:
+class RayHintTrainer(RayPPOTrainer):
     """Distributed PPO trainer using Ray for scalable reinforcement learning.
 
     This trainer orchestrates distributed PPO training across multiple nodes and GPUs,
     managing actor rollouts, critic training, and reward computation with Ray backend.
     Supports various model architectures including FSDP, Megatron, vLLM, and SGLang integration.
     """
-
-    # TODO: support each role have individual ray_worker_group_cls,
-    # i.e., support different backend of different role
     def __init__(
         self,
         config,
@@ -342,213 +100,29 @@ class RayHintTrainer:
             train_sampler (Optional[Sampler], optional): Sampler for the training dataset. Defaults to None.
             device_name (str, optional): Device name for training (e.g., "cuda", "cpu"). Defaults to None.
         """
-
-        # Store the tokenizer for text processing
-        self.tokenizer = tokenizer
-        self.processor = processor
-        self.config = config
-        self.reward_fn = reward_fn
-        self.val_reward_fn = val_reward_fn
-
-        self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
-        assert self.hybrid_engine, "Currently, only support hybrid engine"
-
-        if self.hybrid_engine:
-            assert Role.ActorRollout in role_worker_mapping, f"{role_worker_mapping.keys()=}"
-
-        self.role_worker_mapping = role_worker_mapping
-        self.resource_pool_manager = resource_pool_manager
-        self.use_reference_policy = need_reference_policy(self.role_worker_mapping)
-        self.use_rm = need_reward_model(self.role_worker_mapping)
-        self.use_critic = need_critic(self.config)
-        self.ray_worker_group_cls = ray_worker_group_cls
-        self.device_name = device_name if device_name else self.config.trainer.device
-        self.validation_generations_logger = ValidationGenerationsLogger(
-            project_name=self.config.trainer.project_name,
-            experiment_name=self.config.trainer.experiment_name,
+        super().__init__(
+            config,
+            tokenizer,
+            role_worker_mapping,
+            resource_pool_manager,
+            ray_worker_group_cls=ray_worker_group_cls,
+            processor=processor,
+            reward_fn=reward_fn,
+            val_reward_fn=val_reward_fn,
+            train_dataset=train_dataset,
+            val_dataset=val_dataset,
+            collate_fn=collate_fn,
+            train_sampler=train_sampler,
+            device_name=device_name,
         )
 
         # Initialize reward tracker for monitoring data point rewards
         self.reward_tracker = RewardTracker()
 
-        # if ref_in_actor is True, the reference policy will be actor without lora applied
-        self.ref_in_actor = (
-            config.actor_rollout_ref.model.get("lora_rank", 0) > 0
-            or config.actor_rollout_ref.model.get("lora_adapter_path") is not None
-        )
-
-        # define in-reward KL control
-        # kl loss control currently not suppoorted
-        if self.config.algorithm.use_kl_in_reward:
-            self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
-
-        self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
-
-    def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
-        """
-        Creates the train and validation dataloaders.
-        """
-        # TODO: we have to make sure the batch size is divisible by the dp size
-        from verl.trainer.main_ppo import create_rl_dataset, create_rl_sampler
-
-        if train_dataset is None:
-            train_dataset = create_rl_dataset(
-                self.config.data.train_files,
-                self.config.data,
-                self.tokenizer,
-                self.processor,
-                max_samples=self.config.data.get("train_max_samples", -1),
-            )
-        if val_dataset is None:
-            val_dataset = create_rl_dataset(
-                self.config.data.val_files,
-                self.config.data,
-                self.tokenizer,
-                self.processor,
-                max_samples=self.config.data.get("val_max_samples", -1),
-            )
-        self.train_dataset, self.val_dataset = train_dataset, val_dataset
-
-        if train_sampler is None:
-            train_sampler = create_rl_sampler(self.config.data, self.train_dataset)
-        if collate_fn is None:
-            from verl.utils.dataset.rl_dataset import collate_fn as default_collate_fn
-
-            collate_fn = default_collate_fn
-
-        num_workers = self.config.data["dataloader_num_workers"]
-
-        self.train_dataloader = StatefulDataLoader(
-            dataset=self.train_dataset,
-            batch_size=self.config.data.get("gen_batch_size", self.config.data.train_batch_size),
-            num_workers=num_workers,
-            drop_last=True,
-            collate_fn=collate_fn,
-            sampler=train_sampler,
-        )
-
-        val_batch_size = self.config.data.val_batch_size  # Prefer config value if set
-        if val_batch_size is None:
-            val_batch_size = len(self.val_dataset)
-
-        self.val_dataloader = StatefulDataLoader(
-            dataset=self.val_dataset,
-            batch_size=val_batch_size,
-            num_workers=num_workers,
-            shuffle=self.config.data.get("validation_shuffle", True),
-            drop_last=False,
-            collate_fn=collate_fn,
-        )
-
-        assert len(self.train_dataloader) >= 1, "Train dataloader is empty!"
-        assert len(self.val_dataloader) >= 1, "Validation dataloader is empty!"
-
-        print(
-            f"Size of train dataloader: {len(self.train_dataloader)}, Size of val dataloader: "
-            f"{len(self.val_dataloader)}"
-        )
-
-        total_training_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
-
-        if self.config.trainer.total_training_steps is not None:
-            total_training_steps = self.config.trainer.total_training_steps
-
-        self.total_training_steps = total_training_steps
-        print(f"Total training steps: {self.total_training_steps}")
-
-        try:
-            OmegaConf.set_struct(self.config, True)
-            with open_dict(self.config):
-                if OmegaConf.select(self.config, "actor_rollout_ref.actor.optim"):
-                    self.config.actor_rollout_ref.actor.optim.total_training_steps = total_training_steps
-                if OmegaConf.select(self.config, "critic.optim"):
-                    self.config.critic.optim.total_training_steps = total_training_steps
-        except Exception as e:
-            print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
-
-    def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
-        """Dump rollout/validation samples as JSONL."""
-        os.makedirs(dump_path, exist_ok=True)
-        filename = os.path.join(dump_path, f"{self.global_steps}.jsonl")
-
-        n = len(inputs)
-        base_data = {
-            "input": inputs,
-            "output": outputs,
-            "gts": gts,
-            "score": scores,
-            "step": [self.global_steps] * n,
-        }
-
-        for k, v in reward_extra_infos_dict.items():
-            if len(v) == n:
-                base_data[k] = v
-
-        lines = []
-        for i in range(n):
-            entry = {k: v[i] for k, v in base_data.items()}
-            lines.append(json.dumps(entry, ensure_ascii=False))
-
-        with open(filename, "w") as f:
-            f.write("\n".join(lines) + "\n")
-
-        print(f"Dumped generations to {filename}")
-
-    def _log_rollout_data(
-        self, batch: DataProto, reward_extra_infos_dict: dict, timing_raw: dict, rollout_data_dir: str
-    ):
-        """Log rollout data to disk.
-        Args:
-            batch (DataProto): The batch containing rollout data
-            reward_extra_infos_dict (dict): Additional reward information to log
-            timing_raw (dict): Timing information for profiling
-            rollout_data_dir (str): Directory path to save the rollout data
-        """
-        with marked_timer("dump_rollout_generations", timing_raw, color="green"):
-            inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
-            outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
-            scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
-            sample_gts = [item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in batch]
-
-            reward_extra_infos_to_dump = reward_extra_infos_dict.copy()
-            if "request_id" in batch.non_tensor_batch:
-                reward_extra_infos_dict.setdefault(
-                    "request_id",
-                    batch.non_tensor_batch["request_id"].tolist(),
-                )
-
-            self._dump_generations(
-                inputs=inputs,
-                outputs=outputs,
-                gts=sample_gts,
-                scores=scores,
-                reward_extra_infos_dict=reward_extra_infos_to_dump,
-                dump_path=rollout_data_dir,
-            )
-
-    def _maybe_log_val_generations(self, inputs, outputs, scores):
-        """Log a table of validation samples to the configured logger (wandb or swanlab)"""
-
-        generations_to_log = self.config.trainer.log_val_generations
-
-        if generations_to_log == 0:
-            return
-
-        import numpy as np
-
-        # Create tuples of (input, output, score) and sort by input text
-        samples = list(zip(inputs, outputs, scores, strict=True))
-        samples.sort(key=lambda x: x[0])  # Sort by input text
-
-        # Use fixed random seed for deterministic shuffling
-        rng = np.random.RandomState(42)
-        rng.shuffle(samples)
-
-        # Take first N samples after shuffling
-        samples = samples[:generations_to_log]
-
-        # Log to each configured logger
-        self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
+        # Select hinting strategy: "sage" (on-policy) or "sage-light" (original/off-policy-like)
+        self.hint_method = self.config.trainer.get("method", "sage-light")
+        if self.hint_method not in {"sage", "sage-light"}:
+            raise ValueError(f"Unsupported trainer.method '{self.hint_method}'. Choose 'sage' or 'sage-light'.")
 
     def _build_hint_messages(self, question: str, solution: str) -> list[dict[str, str]]:
         return [
@@ -825,254 +399,6 @@ class RayHintTrainer:
 
         return gen_batch
     
-    def _validate(self):
-        data_source_lst = []
-        reward_extra_infos_dict: dict[str, list] = defaultdict(list)
-
-        # Lists to collect samples for the table
-        sample_inputs = []
-        sample_outputs = []
-        sample_gts = []
-        sample_scores = []
-        sample_turns = []
-        sample_uids = []
-
-        for test_data in self.val_dataloader:
-            test_batch = DataProto.from_single_dict(test_data)
-
-            if "uid" not in test_batch.non_tensor_batch:
-                test_batch.non_tensor_batch["uid"] = np.array(
-                    [str(uuid.uuid4()) for _ in range(len(test_batch.batch))], dtype=object
-                )
-
-            # repeat test batch
-            test_batch = test_batch.repeat(
-                repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n, interleave=True
-            )
-
-            # we only do validation on rule-based rm
-            if self.config.reward_model.enable and test_batch[0].non_tensor_batch["reward_model"]["style"] == "model":
-                return {}
-
-            # Store original inputs
-            input_ids = test_batch.batch["input_ids"]
-            # TODO: Can we keep special tokens except for padding tokens?
-            input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
-            sample_inputs.extend(input_texts)
-            sample_uids.extend(test_batch.non_tensor_batch["uid"])
-
-            ground_truths = [
-                item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in test_batch
-            ]
-            sample_gts.extend(ground_truths)
-
-            test_gen_batch = self._get_gen_batch(test_batch)
-            test_gen_batch.meta_info = {
-                "eos_token_id": self.tokenizer.eos_token_id,
-                "pad_token_id": self.tokenizer.pad_token_id,
-                "recompute_log_prob": False,
-                "do_sample": self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
-                "validate": True,
-                "global_steps": self.global_steps,
-            }
-            print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
-
-            # pad to be divisible by dp_size
-            size_divisor = (
-                self.actor_rollout_wg.world_size
-                if not self.async_rollout_mode
-                else self.config.actor_rollout_ref.rollout.agent.num_workers
-            )
-            test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, size_divisor)
-            if not self.async_rollout_mode:
-                test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
-            else:
-                test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
-
-            # unpad
-            test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
-
-            print("validation generation end")
-
-            # Store generated outputs
-            output_ids = test_output_gen_batch.batch["responses"]
-            output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
-            sample_outputs.extend(output_texts)
-
-            test_batch = test_batch.union(test_output_gen_batch)
-            test_batch.meta_info["validate"] = True
-
-            # evaluate using reward_function
-            if self.val_reward_fn is None:
-                raise ValueError("val_reward_fn must be provided for validation.")
-            result = self.val_reward_fn(test_batch, return_dict=True)
-            reward_tensor = result["reward_tensor"]
-            scores = reward_tensor.sum(-1).cpu().tolist()
-            sample_scores.extend(scores)
-
-            reward_extra_infos_dict["reward"].extend(scores)
-            if "reward_extra_info" in result:
-                for key, lst in result["reward_extra_info"].items():
-                    reward_extra_infos_dict[key].extend(lst)
-
-            # collect num_turns of each prompt
-            if "__num_turns__" in test_batch.non_tensor_batch:
-                sample_turns.append(test_batch.non_tensor_batch["__num_turns__"])
-
-            data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
-
-        self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
-
-        # dump generations
-        val_data_dir = self.config.trainer.get("validation_data_dir", None)
-        if val_data_dir:
-            self._dump_generations(
-                inputs=sample_inputs,
-                outputs=sample_outputs,
-                gts=sample_gts,
-                scores=sample_scores,
-                reward_extra_infos_dict=reward_extra_infos_dict,
-                dump_path=val_data_dir,
-            )
-
-        for key_info, lst in reward_extra_infos_dict.items():
-            assert len(lst) == 0 or len(lst) == len(sample_scores), f"{key_info}: {len(lst)=}, {len(sample_scores)=}"
-
-        data_sources = np.concatenate(data_source_lst, axis=0)
-
-        data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
-        metric_dict = {}
-        for data_source, var2metric2val in data_src2var2metric2val.items():
-            core_var = "acc" if "acc" in var2metric2val else "reward"
-            for var_name, metric2val in var2metric2val.items():
-                n_max = max([int(name.split("@")[-1].split("/")[0]) for name in metric2val.keys()])
-                for metric_name, metric_val in metric2val.items():
-                    if (
-                        (var_name == core_var)
-                        and any(metric_name.startswith(pfx) for pfx in ["mean", "maj", "best"])
-                        and (f"@{n_max}" in metric_name)
-                    ):
-                        metric_sec = "val-core"
-                    else:
-                        metric_sec = "val-aux"
-                    pfx = f"{metric_sec}/{data_source}/{var_name}/{metric_name}"
-                    metric_dict[pfx] = metric_val
-
-        if len(sample_turns) > 0:
-            sample_turns = np.concatenate(sample_turns)
-            metric_dict["val-aux/num_turns/min"] = sample_turns.min()
-            metric_dict["val-aux/num_turns/max"] = sample_turns.max()
-            metric_dict["val-aux/num_turns/mean"] = sample_turns.mean()
-
-        return metric_dict
-    
-    def init_workers(self):
-        """Initialize distributed training workers using Ray backend.
-
-        Creates:
-        1. Ray resource pools from configuration
-        2. Worker groups for each role (actor, critic, etc.)
-        """
-        self.resource_pool_manager.create_resource_pool()
-
-        self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
-
-        # create actor and rollout
-        if self.hybrid_engine:
-            resource_pool = self.resource_pool_manager.get_resource_pool(Role.ActorRollout)
-            actor_rollout_cls = RayClassWithInitArgs(
-                cls=self.role_worker_mapping[Role.ActorRollout],
-                config=self.config.actor_rollout_ref,
-                role=str(Role.ActorRollout),
-            )
-            self.resource_pool_to_cls[resource_pool][str(Role.ActorRollout)] = actor_rollout_cls
-        else:
-            raise NotImplementedError
-
-        # create critic
-        if self.use_critic:
-            resource_pool = self.resource_pool_manager.get_resource_pool(Role.Critic)
-            critic_cfg = omega_conf_to_dataclass(self.config.critic)
-            critic_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.Critic], config=critic_cfg)
-            self.resource_pool_to_cls[resource_pool][str(Role.Critic)] = critic_cls
-
-        # create reference policy if needed
-        if self.use_reference_policy:
-            resource_pool = self.resource_pool_manager.get_resource_pool(Role.RefPolicy)
-            ref_policy_cls = RayClassWithInitArgs(
-                self.role_worker_mapping[Role.RefPolicy],
-                config=self.config.actor_rollout_ref,
-                role=str(Role.RefPolicy),
-            )
-            self.resource_pool_to_cls[resource_pool][str(Role.RefPolicy)] = ref_policy_cls
-
-        # create a reward model if reward_fn is None
-        if self.use_rm:
-            # we create a RM here
-            resource_pool = self.resource_pool_manager.get_resource_pool(Role.RewardModel)
-            rm_cls = RayClassWithInitArgs(self.role_worker_mapping[Role.RewardModel], config=self.config.reward_model)
-            self.resource_pool_to_cls[resource_pool][str(Role.RewardModel)] = rm_cls
-
-        # initialize WorkerGroup
-        # NOTE: if you want to use a different resource pool for each role, which can support different parallel size,
-        # you should not use `create_colocated_worker_cls`.
-        # Instead, directly pass different resource pool to different worker groups.
-        # See https://github.com/volcengine/verl/blob/master/examples/ray/tutorial.ipynb for more information.
-        all_wg = {}
-        wg_kwargs = {}  # Setting up kwargs for RayWorkerGroup
-        if OmegaConf.select(self.config.trainer, "ray_wait_register_center_timeout") is not None:
-            wg_kwargs["ray_wait_register_center_timeout"] = self.config.trainer.ray_wait_register_center_timeout
-        if OmegaConf.select(self.config.global_profiler, "steps") is not None:
-            wg_kwargs["profile_steps"] = OmegaConf.select(self.config.global_profiler, "steps")
-            # Only require nsight worker options when tool is nsys
-            if OmegaConf.select(self.config.global_profiler, "tool") == "nsys":
-                assert (
-                    OmegaConf.select(self.config.global_profiler.global_tool_config.nsys, "worker_nsight_options")
-                    is not None
-                ), "worker_nsight_options must be set when using nsys with profile_steps"
-                wg_kwargs["worker_nsight_options"] = OmegaConf.to_container(
-                    OmegaConf.select(self.config.global_profiler.global_tool_config.nsys, "worker_nsight_options")
-                )
-        wg_kwargs["device_name"] = self.device_name
-
-        for resource_pool, class_dict in self.resource_pool_to_cls.items():
-            worker_dict_cls = create_colocated_worker_cls(class_dict=class_dict)
-            wg_dict = self.ray_worker_group_cls(
-                resource_pool=resource_pool,
-                ray_cls_with_init=worker_dict_cls,
-                **wg_kwargs,
-            )
-            spawn_wg = wg_dict.spawn(prefix_set=class_dict.keys())
-            all_wg.update(spawn_wg)
-
-        if self.use_critic:
-            self.critic_wg = all_wg[str(Role.Critic)]
-            self.critic_wg.init_model()
-
-        if self.use_reference_policy and not self.ref_in_actor:
-            self.ref_policy_wg = all_wg[str(Role.RefPolicy)]
-            self.ref_policy_wg.init_model()
-
-        self.rm_wg = None
-        # initalization of rm_wg will be deprecated in the future
-        if self.use_rm:
-            self.rm_wg = all_wg[str(Role.RewardModel)]
-            self.rm_wg.init_model()
-
-        # we should create rollout at the end so that vllm can have a better estimation of kv cache memory
-        self.actor_rollout_wg = all_wg[str(Role.ActorRollout)]
-        self.actor_rollout_wg.init_model()
-
-        # create async rollout manager and request scheduler
-        self.async_rollout_mode = False
-        if self.config.actor_rollout_ref.rollout.mode == "async":
-            from verl.experimental.agent_loop import AgentLoopManager
-
-            self.async_rollout_mode = True
-            self.async_rollout_manager = AgentLoopManager(
-                config=self.config, worker_group=self.actor_rollout_wg, rm_wg=self.rm_wg
-            )
-
     def _save_checkpoint(self):
         from verl.utils.fs import local_mkdir_safe
 
@@ -1146,7 +472,7 @@ class RayHintTrainer:
         if self.config.trainer.default_hdfs_dir is not None:
             raise NotImplementedError("load from hdfs is not implemented yet")
         else:
-            checkpoint_folder = self.config.trainer.default_local_dir  # TODO: check path
+            checkpoint_folder = self.config.trainer.default_local_dir
             if not os.path.isabs(checkpoint_folder):
                 working_dir = os.getcwd()
                 checkpoint_folder = os.path.join(working_dir, checkpoint_folder)
@@ -1188,7 +514,6 @@ class RayHintTrainer:
             )
 
         # load dataloader,
-        # TODO: from remote not implemented yet
         dataloader_local_path = os.path.join(global_step_folder, "data.pt")
         if os.path.exists(dataloader_local_path):
             dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
@@ -1199,124 +524,6 @@ class RayHintTrainer:
         # load reward tracker
         self.reward_tracker.load_checkpoint(global_step_folder)
 
-    def _start_profiling(self, do_profile: bool) -> None:
-        """Start profiling for all worker groups if profiling is enabled."""
-        if do_profile:
-            self.actor_rollout_wg.start_profile(role="e2e", profile_step=self.global_steps)
-            if self.use_reference_policy:
-                self.ref_policy_wg.start_profile(profile_step=self.global_steps)
-            if self.use_critic:
-                self.critic_wg.start_profile(profile_step=self.global_steps)
-            if self.use_rm:
-                self.rm_wg.start_profile(profile_step=self.global_steps)
-
-    def _stop_profiling(self, do_profile: bool) -> None:
-        """Stop profiling for all worker groups if profiling is enabled."""
-        if do_profile:
-            self.actor_rollout_wg.stop_profile()
-            if self.use_reference_policy:
-                self.ref_policy_wg.stop_profile()
-            if self.use_critic:
-                self.critic_wg.stop_profile()
-            if self.use_rm:
-                self.rm_wg.stop_profile()
-
-    def _balance_batch(self, batch: DataProto, metrics, logging_prefix="global_seqlen", keep_minibatch=False):
-        """Reorder the data on single controller such that each dp rank gets similar total tokens"""
-        attention_mask = batch.batch["attention_mask"]
-        batch_size = attention_mask.shape[0]
-        global_seqlen_lst = batch.batch["attention_mask"].view(batch_size, -1).sum(-1)  # (train_batch_size,)
-        global_seqlen_lst = calculate_workload(global_seqlen_lst)
-        world_size = self.actor_rollout_wg.world_size
-        if keep_minibatch:
-            # Decouple the DP balancing and mini-batching.
-            minibatch_size = self.config.actor_rollout_ref.actor.get("ppo_mini_batch_size")
-            minibatch_num = len(global_seqlen_lst) // minibatch_size
-            global_partition_lst = [[] for _ in range(world_size)]
-            for i in range(minibatch_num):
-                rearrange_minibatch_lst = get_seqlen_balanced_partitions(
-                    global_seqlen_lst[i * minibatch_size : (i + 1) * minibatch_size],
-                    k_partitions=world_size,
-                    equal_size=True,
-                )
-                for j, part in enumerate(rearrange_minibatch_lst):
-                    global_partition_lst[j].extend([x + minibatch_size * i for x in part])
-        else:
-            global_partition_lst = get_seqlen_balanced_partitions(
-                global_seqlen_lst, k_partitions=world_size, equal_size=True
-            )
-        # Place smaller micro-batches at both ends to reduce the bubbles in pipeline parallel.
-        for idx, partition in enumerate(global_partition_lst):
-            partition.sort(key=lambda x: (global_seqlen_lst[x], x))
-            ordered_partition = partition[::2] + partition[1::2][::-1]
-            global_partition_lst[idx] = ordered_partition
-        # reorder based on index. The data will be automatically equally partitioned by dispatch function
-        global_idx = torch.tensor([j for partition in global_partition_lst for j in partition])
-        batch.reorder(global_idx)
-        global_balance_stats = log_seqlen_unbalance(
-            seqlen_list=global_seqlen_lst, partitions=global_partition_lst, prefix=logging_prefix
-        )
-        metrics.update(global_balance_stats)
-
-    def compute_rollout_importance_weights_and_add_to_batch(self, batch: DataProto) -> tuple[DataProto, dict]:
-        """Compute IS weights and apply rejection sampling for rollout-training mismatch.
-
-        Computes importance sampling weights to correct for distribution mismatch between
-        rollout and training policies. Applies rejection sampling (mask mode/veto) by
-        modifying response_mask. Always updates response_mask; conditionally adds IS weights.
-
-        Key behavior:
-        - response_mask: ALWAYS updated with rejection (mask mode + veto excluded from training)
-        - rollout_is_weights: Added to batch ONLY if config.algorithm.rollout_is=True
-
-        This separation ensures:
-        - Rejection works even when IS weights are disabled (rollout_is=False)
-        - Metrics can be monitored before enabling IS weight application
-
-        Args:
-            batch: DataProto with old_log_probs, rollout_log_probs, response_mask
-
-        Returns:
-            Tuple of (updated_batch, metrics):
-                updated_batch: Batch with modified response_mask (always) and rollout_is_weights (if rollout_is=True)
-                metrics: Dict of IS and mismatch metrics, all with "mismatch/" prefix
-        """
-        # Compute rollout IS weights if enabled and data is available
-        # rollout_is_threshold is the main on/off switch (None = disabled, float = enabled)
-        rollout_is_threshold = self.config.algorithm.get("rollout_is_threshold", None)
-        if rollout_is_threshold is not None and rollout_is_threshold > 0 and "rollout_log_probs" in batch.batch:
-            # Compute IS weights and get modified response_mask
-            rollout_is_weights, modified_response_mask, rollout_is_metrics = compute_rollout_importance_weights(
-                old_log_prob=batch.batch["old_log_probs"],
-                rollout_log_prob=batch.batch["rollout_log_probs"],
-                response_mask=batch.batch["response_mask"],
-                rollout_is_level=self.config.algorithm.rollout_is_level,
-                rollout_is_mode=self.config.algorithm.rollout_is_mode,
-                rollout_is_threshold=self.config.algorithm.rollout_is_threshold,
-                rollout_is_threshold_lower=self.config.algorithm.get("rollout_is_threshold_lower", None),
-                rollout_is_veto_threshold=self.config.algorithm.get("rollout_is_veto_threshold", None),
-            )
-
-            # ALWAYS update response_mask with rejection (even if rollout_is=False)
-            # - Mask mode: tokens with outlier IS ratios excluded
-            # - Veto: sequences with catastrophic tokens excluded
-            # This ensures correct loss normalization (rejected samples not in denominator)
-            batch.batch["response_mask"] = modified_response_mask
-
-            # Conditionally add IS weights based on rollout_is config flag
-            # - rollout_is=True: Enable IS weight correction in policy loss
-            # - rollout_is=False: Metrics-only mode (rejection still applied via mask)
-            apply_weights = self.config.algorithm.get("rollout_is", False)
-
-            if apply_weights:
-                # Add IS weights (safety-bounded, mode-processed) to enable weight correction
-                batch = batch.union(rollout_is_weights)
-
-            return batch, rollout_is_metrics
-
-        # Return unchanged batch and empty metrics if IS is disabled
-        return batch, {}
-    
     def fit(self):
         """
         The training loop of PPO.
@@ -1473,216 +680,389 @@ class RayHintTrainer:
 
                     index_array = base_batch.non_tensor_batch.get("index")
                     min_threshold = self.config.trainer.get("hint_accuracy_min_threshold", 0)
-                    max_threshold = self.config.trainer.get("hint_accuracy_max_threshold", 0.25)
+                    max_threshold = self.config.trainer.get("hint_accuracy_max_threshold", 0.35)
                     if min_threshold > max_threshold:
                         min_threshold, max_threshold = max_threshold, min_threshold
-                    current_level_by_batch_idx: dict[int, str] = {}
-                    level_to_indices = {"level_1": [], "level_2": [], "level_3": []}
-                    for idx in range(len(base_batch)):
-                        if index_array is not None:
-                            index_str = str(index_array[idx])
-                            prev_level = self.reward_tracker.get_hint_level(index_str, "no_hint")
-                            prev_acc = self.reward_tracker.get_last_hint_accuracy(index_str)
-                        else:
-                            prev_level = "no_hint"
-                            prev_acc = None
 
-                        if prev_acc is None:
-                            level = "no_hint"
-                        else:
-                            level = prev_level
-                            if prev_acc <= min_threshold:
-                                if prev_level == "no_hint":
-                                    level = "level_1"
-                                elif prev_level == "level_1":
-                                    level = "level_2"
-                                elif prev_level == "level_2":
-                                    level = "level_3"
-                                elif prev_level == "level_3":
-                                    level = "level_3"
-                                else:
-                                    level = "no_hint"
-                            elif prev_acc > max_threshold:
-                                if prev_level == "level_3":
-                                    level = "level_2"
-                                elif prev_level == "level_2":
-                                    level = "level_1"
-                                elif prev_level == "level_1":
-                                    level = "no_hint"
-                                elif prev_level == "no_hint":
-                                    level = "no_hint"
-                                else:
-                                    level = "no_hint"
+                    if self.hint_method == "sage":
+                        # On-policy hinting ("sage"): run once, hint unresolved prompts, reroll slices, merge metrics
+                        batch, reward_tensor, reward_extra_infos_dict = run_rollout(base_gen_batch)
 
-                        current_level_by_batch_idx[idx] = level
-                        if level in level_to_indices:
-                            level_to_indices[level].append(idx)
+                        sequence_rewards = reward_tensor.sum(dim=-1) if reward_tensor is not None else None
+                        rewards_per_question = (
+                            sequence_rewards.reshape(len(base_batch), rollout_repeat)
+                            if sequence_rewards is not None
+                            else None
+                        )
+                        resolved_mask = (
+                            torch.any(rewards_per_question > 0, dim=1) if rewards_per_question is not None else None
+                        )
 
-                    hint_payloads: dict[int, dict[str, Any]] = {}
-                    hint_payloads_raw: dict[int, str] = {}
-                    hint_failed = 0
-                    hint_attempts = 0
-                    generated_payloads: dict[int, dict[str, Any]] = {}
+                        hint_payloads: dict[int, dict[str, Any]] = {}
+                        hint_payloads_raw: dict[int, str] = {}
+                        hint_failed = 0
+                        hint_attempts = 0
+                        hint_applied_prompts: set[int] = set()
+                        hint_final_level: dict[int, str] = {}
+                        effective_level_by_batch_idx = {idx: "no_hint" for idx in range(len(base_batch))}
 
-                    need_hint_indices = []
-                    for level_key in ["level_1", "level_2", "level_3"]:
-                        need_hint_indices.extend(level_to_indices[level_key])
+                        if rewards_per_question is not None and not torch.all(resolved_mask):
+                            metrics["hint/prompts_needing_hint"] = int((~resolved_mask).sum().item())
+                            requests = []
+                            for idx in range(len(base_batch)):
+                                if not resolved_mask[idx]:
+                                    question, solution = self._extract_question_and_solution(
+                                        base_batch, base_gen_batch, idx
+                                    )
+                                    if question and solution:
+                                        requests.append((idx, question, solution))
 
-                    if need_hint_indices:
-                        requests = []
-                        for idx in need_hint_indices:
-                            question, solution = self._extract_question_and_solution(base_batch, base_gen_batch, idx)
-                            if question and solution:
-                                requests.append((idx, question, solution))
-
-                        if requests:
-                            generated_payloads, hint_failed, hint_attempts, hint_payloads_raw = self._generate_hints_batch(
+                            hint_payloads, hint_failed, hint_attempts, hint_payloads_raw = self._generate_hints_batch(
                                 requests
                             )
-                            hint_payloads.update(generated_payloads)
                             metrics["hint/generate_failed"] = hint_failed
                             metrics["hint/generate_attempts"] = hint_attempts
                             metrics["hint/generate_requested"] = len(requests)
-                            metrics["hint/generate_success"] = len(generated_payloads)
-
-                            if index_array is not None and generated_payloads:
-                                for idx, payload in generated_payloads.items():
-                                    self.reward_tracker.set_last_hint_payload(str(index_array[idx]), payload)
-                                self.reward_tracker.log_hint_raw(
-                                    index_array,
-                                    {idx: raw for idx, raw in hint_payloads_raw.items()},
-                                    self.global_steps,
-                                    used=False,
-                                    failed=False,
-                                )
-                                self.reward_tracker.log_hint_payloads(
-                                    index_array,
-                                    generated_payloads,
-                                    self.global_steps,
-                                    used=False,
-                                    failed=False,
-                                )
-
-                            if index_array is not None and hint_failed:
-                                failed_indices = [idx for idx, _, _ in requests if idx not in generated_payloads]
-                                if failed_indices:
-                                    fallback_used = 0
-                                    for idx in failed_indices:
-                                        fallback_payload = self.reward_tracker.get_last_hint_payload(
-                                            str(index_array[idx])
-                                        )
-                                        if fallback_payload:
-                                            hint_payloads[idx] = fallback_payload
-                                            fallback_used += 1
-                                    if fallback_used:
-                                        metrics["hint/fallback_used"] = fallback_used
-                                    failed_payloads = {idx: {} for idx in failed_indices}
+                            if hint_payloads:
+                                metrics["hint/used"] = 1
+                                metrics["hint/num_questions"] = len(hint_payloads)
+                                metrics["hint/generate_success"] = len(hint_payloads)
+                                if "index" in base_batch.non_tensor_batch:
+                                    self.reward_tracker.log_hint_raw(
+                                        base_batch.non_tensor_batch["index"],
+                                        {idx: raw for idx, raw in hint_payloads_raw.items()},
+                                        self.global_steps,
+                                        used=False,
+                                        failed=False,
+                                    )
                                     self.reward_tracker.log_hint_payloads(
-                                        index_array,
+                                        base_batch.non_tensor_batch["index"],
+                                        hint_payloads,
+                                        self.global_steps,
+                                        used=False,
+                                        failed=False,
+                                    )
+                            else:
+                                if "index" in base_batch.non_tensor_batch and hint_failed:
+                                    failed_payloads = {idx: {} for idx in requests}
+                                    self.reward_tracker.log_hint_payloads(
+                                        base_batch.non_tensor_batch["index"],
                                         failed_payloads,
                                         self.global_steps,
                                         used=False,
                                         failed=True,
                                     )
                                     self.reward_tracker.log_hint_raw(
-                                        index_array,
-                                        {idx: hint_payloads_raw.get(idx, "") for idx in failed_indices},
+                                        base_batch.non_tensor_batch["index"],
+                                        {idx: hint_payloads_raw.get(idx, "") for idx in requests},
                                         self.global_steps,
                                         used=False,
                                         failed=True,
                                     )
 
-                    gen_batch_to_use = base_gen_batch
-                    hint_applied_prompts: set[int] = set()
-                    effective_level_by_batch_idx = {idx: "no_hint" for idx in range(len(base_batch))}
+                            for level_key in ["level_1", "level_2", "level_3"]:
+                                target_indices = [
+                                    idx
+                                    for idx in range(len(base_batch))
+                                    if not resolved_mask[idx]
+                                    and idx in hint_payloads
+                                    and isinstance(hint_payloads[idx].get(level_key, ""), str)
+                                    and hint_payloads[idx].get(level_key, "").strip()
+                                ]
+                                if not target_indices:
+                                    continue
 
-                    for level_key in ["level_1", "level_2", "level_3"]:
-                        target_indices = level_to_indices[level_key]
-                        if not target_indices:
-                            continue
-                        payload_subset: dict[int, dict[str, Any]] = {}
-                        for idx in target_indices:
-                            payload = hint_payloads.get(idx)
-                            if payload:
-                                payload_subset[idx] = payload
-                        if not payload_subset:
-                            continue
+                                hinted = self._apply_hints_to_gen_batch(
+                                    base_gen_batch, base_batch, target_indices, hint_payloads, level_key
+                                )
+                                if hinted is None:
+                                    continue
+                                gen_batch_to_use, applied_indices = hinted
 
-                        hinted = self._apply_hints_to_gen_batch(
-                            gen_batch_to_use, base_batch, target_indices, payload_subset, level_key
-                        )
-                        if hinted is None:
-                            continue
-                        gen_batch_to_use, applied_indices = hinted
+                                candidate_batch, candidate_reward_tensor, _ = run_rollout(gen_batch_to_use)
 
-                        if applied_indices:
-                            hint_applied_prompts.update(applied_indices)
-                            for idx in applied_indices:
-                                effective_level_by_batch_idx[idx] = level_key
+                                self._replace_slices(batch, candidate_batch, applied_indices, rollout_repeat)
+                                for idx in applied_indices:
+                                    start = idx * rollout_repeat
+                                    end = start + rollout_repeat
+                                    reward_tensor[start:end] = candidate_reward_tensor[start:end]
 
-                            if index_array is not None:
-                                payload_applied = {
-                                    idx: payload_subset[idx] for idx in applied_indices if idx in payload_subset
-                                }
-                                if payload_applied:
-                                    self.reward_tracker.log_hint_payloads(
-                                        index_array,
-                                        payload_applied,
-                                        self.global_steps,
-                                        used=True,
-                                        failed=False,
-                                    )
-                                raw_subset = {
-                                    idx: hint_payloads_raw.get(idx, "")
-                                    for idx in applied_indices
-                                    if idx in hint_payloads_raw
-                                }
-                                if raw_subset:
-                                    self.reward_tracker.log_hint_raw(
-                                        index_array,
-                                        raw_subset,
-                                        self.global_steps,
-                                        used=True,
-                                        failed=False,
-                                    )
+                                if applied_indices:
+                                    hint_applied_prompts.update(applied_indices)
+                                    for idx in applied_indices:
+                                        hint_final_level[idx] = level_key
+                                        effective_level_by_batch_idx[idx] = level_key
 
-                    batch, reward_tensor, reward_extra_infos_dict = run_rollout(gen_batch_to_use)
+                                if "index" in base_batch.non_tensor_batch:
+                                    payload_subset = {
+                                        idx: hint_payloads[idx] for idx in applied_indices if idx in hint_payloads
+                                    }
+                                    if payload_subset:
+                                        raw_subset = {idx: hint_payloads_raw.get(idx, "") for idx in applied_indices}
+                                        self.reward_tracker.log_hint_raw(
+                                            base_batch.non_tensor_batch["index"],
+                                            raw_subset,
+                                            self.global_steps,
+                                            used=True,
+                                            failed=False,
+                                        )
+                                        self.reward_tracker.log_hint_payloads(
+                                            base_batch.non_tensor_batch["index"],
+                                            payload_subset,
+                                            self.global_steps,
+                                            used=True,
+                                            failed=False,
+                                        )
 
-                    sequence_rewards = reward_tensor.sum(dim=-1) if reward_tensor is not None else None
-                    rewards_per_question = (
-                        sequence_rewards.reshape(len(base_batch), rollout_repeat)
-                        if sequence_rewards is not None
-                        else None
-                    )
+                                sequence_rewards = reward_tensor.sum(dim=-1)
+                                rewards_per_question = sequence_rewards.reshape(len(base_batch), rollout_repeat)
+                                resolved_mask = torch.any(rewards_per_question > 0, dim=1)
 
-                    accuracies = []
-                    if rewards_per_question is not None:
-                        correct_mask = rewards_per_question > 0
-                        accuracies = correct_mask.float().mean(dim=1).cpu().tolist()
-
-                        level_accumulators = {"no_hint": [], "level_1": [], "level_2": [], "level_3": []}
-                        for idx, acc in enumerate(accuracies):
-                            level = effective_level_by_batch_idx.get(idx, "no_hint")
-                            level_accumulators[level].append(acc)
+                            reward_extra_infos_dict = {}
 
                         metrics["hint/prompts_with_hint"] = len(hint_applied_prompts)
-                        for level_key, accs in level_accumulators.items():
-                            metrics[f"hint/used_{level_key}"] = len(accs)
-                            if accs:
-                                metrics[f"hint/acc_{level_key}_mean"] = float(np.mean(accs))
+                        level_counts = {"level_1": 0, "level_2": 0, "level_3": 0}
+                        for level in hint_final_level.values():
+                            if level in level_counts:
+                                level_counts[level] += 1
+                        for level_key, count in level_counts.items():
+                            metrics[f"hint/used_{level_key}"] = count
+                        metrics["hint/generate_success"] = metrics.get("hint/generate_success", len(hint_final_level))
 
-                        if index_array is not None:
-                            self.reward_tracker.log_hint_accuracy(
-                                index_array, effective_level_by_batch_idx, accuracies, self.global_steps
-                            )
-                            metrics["hint/accuracy_min_threshold"] = float(min_threshold)
-                            metrics["hint/accuracy_max_threshold"] = float(max_threshold)
+                        accuracies = []
+                        if rewards_per_question is not None:
+                            correct_mask = rewards_per_question > 0
+                            accuracies = correct_mask.float().mean(dim=1).cpu().tolist()
+
+                            level_accumulators = {"no_hint": [], "level_1": [], "level_2": [], "level_3": []}
                             for idx, acc in enumerate(accuracies):
-                                index_str = str(index_array[idx])
-                                current_level = effective_level_by_batch_idx.get(idx, "no_hint")
-                                self.reward_tracker.set_hint_level(index_str, current_level)
-                                self.reward_tracker.set_last_hint_accuracy(index_str, acc)
+                                level = effective_level_by_batch_idx.get(idx, "no_hint")
+                                level_accumulators[level].append(acc)
 
+                            for level_key, accs in level_accumulators.items():
+                                metrics[f"hint/used_{level_key}"] = metrics.get(f"hint/used_{level_key}", 0) + len(accs)
+                                if accs:
+                                    metrics[f"hint/acc_{level_key}_mean"] = float(np.mean(accs))
+
+                            if index_array is not None:
+                                self.reward_tracker.log_hint_accuracy(
+                                    index_array, effective_level_by_batch_idx, accuracies, self.global_steps
+                                )
+                                metrics["hint/accuracy_min_threshold"] = float(min_threshold)
+                                metrics["hint/accuracy_max_threshold"] = float(max_threshold)
+                                for idx, acc in enumerate(accuracies):
+                                    index_str = str(index_array[idx])
+                                    current_level = effective_level_by_batch_idx.get(idx, "no_hint")
+                                    self.reward_tracker.set_hint_level(index_str, current_level)
+                                    self.reward_tracker.set_last_hint_accuracy(index_str, acc)
+                    else:
+                        # Original (off-policy style) hint logic ("sage-light")
+                        current_level_by_batch_idx: dict[int, str] = {}
+                        level_to_indices = {"level_1": [], "level_2": [], "level_3": []}
+                        for idx in range(len(base_batch)):
+                            if index_array is not None:
+                                index_str = str(index_array[idx])
+                                prev_level = self.reward_tracker.get_hint_level(index_str, "no_hint")
+                                prev_acc = self.reward_tracker.get_last_hint_accuracy(index_str)
+                            else:
+                                prev_level = "no_hint"
+                                prev_acc = None
+
+                            if prev_acc is None:
+                                level = "no_hint"
+                            else:
+                                level = prev_level
+                                if prev_acc <= min_threshold:
+                                    if prev_level == "no_hint":
+                                        level = "level_1"
+                                    elif prev_level == "level_1":
+                                        level = "level_2"
+                                    elif prev_level == "level_2":
+                                        level = "level_3"
+                                    elif prev_level == "level_3":
+                                        level = "level_3"
+                                    else:
+                                        level = "no_hint"
+                                elif prev_acc > max_threshold:
+                                    if prev_level == "level_3":
+                                        level = "level_2"
+                                    elif prev_level == "level_2":
+                                        level = "level_1"
+                                    elif prev_level == "level_1":
+                                        level = "no_hint"
+                                    elif prev_level == "no_hint":
+                                        level = "no_hint"
+                                    else:
+                                        level = "no_hint"
+
+                            current_level_by_batch_idx[idx] = level
+                            if level in level_to_indices:
+                                level_to_indices[level].append(idx)
+
+                        hint_payloads: dict[int, dict[str, Any]] = {}
+                        hint_payloads_raw: dict[int, str] = {}
+                        hint_failed = 0
+                        hint_attempts = 0
+                        generated_payloads: dict[int, dict[str, Any]] = {}
+
+                        need_hint_indices = []
+                        for level_key in ["level_1", "level_2", "level_3"]:
+                            need_hint_indices.extend(level_to_indices[level_key])
+
+                        if need_hint_indices:
+                            requests = []
+                            for idx in need_hint_indices:
+                                question, solution = self._extract_question_and_solution(base_batch, base_gen_batch, idx)
+                                if question and solution:
+                                    requests.append((idx, question, solution))
+
+                            if requests:
+                                generated_payloads, hint_failed, hint_attempts, hint_payloads_raw = self._generate_hints_batch(
+                                    requests
+                                )
+                                hint_payloads.update(generated_payloads)
+                                metrics["hint/generate_failed"] = hint_failed
+                                metrics["hint/generate_attempts"] = hint_attempts
+                                metrics["hint/generate_requested"] = len(requests)
+                                metrics["hint/generate_success"] = len(generated_payloads)
+
+                                if index_array is not None and generated_payloads:
+                                    for idx, payload in generated_payloads.items():
+                                        self.reward_tracker.set_last_hint_payload(str(index_array[idx]), payload)
+                                    self.reward_tracker.log_hint_raw(
+                                        index_array,
+                                        {idx: raw for idx, raw in hint_payloads_raw.items()},
+                                        self.global_steps,
+                                        used=False,
+                                        failed=False,
+                                    )
+                                    self.reward_tracker.log_hint_payloads(
+                                        index_array,
+                                        generated_payloads,
+                                        self.global_steps,
+                                        used=False,
+                                        failed=False,
+                                    )
+
+                                if index_array is not None and hint_failed:
+                                    failed_indices = [idx for idx, _, _ in requests if idx not in generated_payloads]
+                                    if failed_indices:
+                                        fallback_used = 0
+                                        for idx in failed_indices:
+                                            fallback_payload = self.reward_tracker.get_last_hint_payload(
+                                                str(index_array[idx])
+                                            )
+                                            if fallback_payload:
+                                                hint_payloads[idx] = fallback_payload
+                                                fallback_used += 1
+                                        if fallback_used:
+                                            metrics["hint/fallback_used"] = fallback_used
+                                        failed_payloads = {idx: {} for idx in failed_indices}
+                                        self.reward_tracker.log_hint_payloads(
+                                            index_array,
+                                            failed_payloads,
+                                            self.global_steps,
+                                            used=False,
+                                            failed=True,
+                                        )
+                                        self.reward_tracker.log_hint_raw(
+                                            index_array,
+                                            {idx: hint_payloads_raw.get(idx, "") for idx in failed_indices},
+                                            self.global_steps,
+                                            used=False,
+                                            failed=True,
+                                        )
+
+                        gen_batch_to_use = base_gen_batch
+                        hint_applied_prompts: set[int] = set()
+                        effective_level_by_batch_idx = {idx: "no_hint" for idx in range(len(base_batch))}
+
+                        for level_key in ["level_1", "level_2", "level_3"]:
+                            target_indices = level_to_indices[level_key]
+                            if not target_indices:
+                                continue
+                            payload_subset: dict[int, dict[str, Any]] = {}
+                            for idx in target_indices:
+                                payload = hint_payloads.get(idx)
+                                if payload:
+                                    payload_subset[idx] = payload
+                            if not payload_subset:
+                                continue
+
+                            hinted = self._apply_hints_to_gen_batch(
+                                gen_batch_to_use, base_batch, target_indices, payload_subset, level_key
+                            )
+                            if hinted is None:
+                                continue
+                            gen_batch_to_use, applied_indices = hinted
+
+                            if applied_indices:
+                                hint_applied_prompts.update(applied_indices)
+                                for idx in applied_indices:
+                                    effective_level_by_batch_idx[idx] = level_key
+
+                                if index_array is not None:
+                                    payload_applied = {
+                                        idx: payload_subset[idx] for idx in applied_indices if idx in payload_subset
+                                    }
+                                    if payload_applied:
+                                        self.reward_tracker.log_hint_payloads(
+                                            index_array,
+                                            payload_applied,
+                                            self.global_steps,
+                                            used=True,
+                                            failed=False,
+                                        )
+                                    raw_subset = {
+                                        idx: hint_payloads_raw.get(idx, "")
+                                        for idx in applied_indices
+                                        if idx in hint_payloads_raw
+                                    }
+                                    if raw_subset:
+                                        self.reward_tracker.log_hint_raw(
+                                            index_array,
+                                            raw_subset,
+                                            self.global_steps,
+                                            used=True,
+                                            failed=False,
+                                        )
+
+                        batch, reward_tensor, reward_extra_infos_dict = run_rollout(gen_batch_to_use)
+
+                        sequence_rewards = reward_tensor.sum(dim=-1) if reward_tensor is not None else None
+                        rewards_per_question = (
+                            sequence_rewards.reshape(len(base_batch), rollout_repeat)
+                            if sequence_rewards is not None
+                            else None
+                        )
+
+                        accuracies = []
+                        if rewards_per_question is not None:
+                            correct_mask = rewards_per_question > 0
+                            accuracies = correct_mask.float().mean(dim=1).cpu().tolist()
+
+                            level_accumulators = {"no_hint": [], "level_1": [], "level_2": [], "level_3": []}
+                            for idx, acc in enumerate(accuracies):
+                                level = effective_level_by_batch_idx.get(idx, "no_hint")
+                                level_accumulators[level].append(acc)
+
+                            metrics["hint/prompts_with_hint"] = len(hint_applied_prompts)
+                            for level_key, accs in level_accumulators.items():
+                                metrics[f"hint/used_{level_key}"] = len(accs)
+                                if accs:
+                                    metrics[f"hint/acc_{level_key}_mean"] = float(np.mean(accs))
+
+                            if index_array is not None:
+                                self.reward_tracker.log_hint_accuracy(
+                                    index_array, effective_level_by_batch_idx, accuracies, self.global_steps
+                                )
+                                metrics["hint/accuracy_min_threshold"] = float(min_threshold)
+                                metrics["hint/accuracy_max_threshold"] = float(max_threshold)
+                                for idx, acc in enumerate(accuracies):
+                                    index_str = str(index_array[idx])
+                                    current_level = effective_level_by_batch_idx.get(idx, "no_hint")
+                                    self.reward_tracker.set_hint_level(index_str, current_level)
+                                    self.reward_tracker.set_last_hint_accuracy(index_str, acc)
                     # recompute old_log_probs
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
                         old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
@@ -1696,7 +1076,6 @@ class RayHintTrainer:
                         batch = batch.union(old_log_prob)
 
                         if "rollout_log_probs" in batch.batch.keys():
-                            # TODO: we may want to add diff of probs too.
                             from verl.utils.debug.metrics import calculate_debug_metrics
 
                             metrics.update(calculate_debug_metrics(batch))
@@ -1839,7 +1218,6 @@ class RayHintTrainer:
                 # collect metrics
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
-                # TODO: implement actual tflpo and theoretical tflpo
                 n_gpus = self.resource_pool_manager.get_n_gpus()
                 metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
                 # Note: mismatch metrics (KL, PPL, etc.) are collected at line 1179 after advantage computation
@@ -1848,7 +1226,6 @@ class RayHintTrainer:
                 if isinstance(self.train_dataloader.sampler, AbstractCurriculumSampler):
                     self.train_dataloader.sampler.update(batch=batch)
 
-                # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
 
                 progress_bar.update(1)

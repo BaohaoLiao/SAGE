@@ -13,4 +13,4 @@ trainer:
   method: sage-light
   # For sage-light, Threshold for switching hint levels based on per-prompt rollout accuracy.
   hint_accuracy_min_threshold: 0.0
-  hint_accuracy_max_threshold: 0.25
+  hint_accuracy_max_threshold: 0.35
