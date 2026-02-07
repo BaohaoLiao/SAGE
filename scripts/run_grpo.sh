@@ -8,14 +8,9 @@ export WORKING_DIR="${PWD}"
 model_name_or_path="Qwen/Qwen2.5-7B-Instruct"
 model_name="Qwen2.5-7B-Instruct"
 
-# SAGE method
-method="sage" # or "sage-light" for faster but slightly worse performance
-hint_accuracy_min_threshold=0.0  # Only work for sage-light: When the accuracy of a prompt from previous epoch is lower than this threshold (hard), the hint level increases by 1.
-hint_accuracy_max_threshold=0.35  # Only work for sage-light When the accuracy of a prompt from previous epoch is larger than this threshold (easy), the hint level decreases by 1.
-
 # Wandb setting
 project_name="SAGE"
-experiment_name="${method}_${model_name}"
+experiment_name="grpo_${model_name}"
 export WANDB_API_KEY=""
 export WANDB_ENTITY=""
 # export WANDB_MODE="offline"
@@ -46,7 +41,7 @@ test_path="./data/test.parquet"
 train_files="['$train_path']"
 test_files="['$test_path']"
 
-python3 -m recipe.hint.main_hint \
+python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=${algorithm} \
     data.train_files=${train_files} \
     data.val_files=${test_files} \
@@ -79,7 +74,6 @@ python3 -m recipe.hint.main_hint \
     actor_rollout_ref.rollout.enable_chunked_prefill=False \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
-    trainer.method=${method} \
     trainer.critic_warmup=0 \
     trainer.logger=['console','wandb'] \
     trainer.project_name=${project_name} \
