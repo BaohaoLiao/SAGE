@@ -1,0 +1,16 @@
+# the hint config will override default ppo_trainer.yaml
+
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+trainer:
+  # Hint strategy: "sage" (on-policy) or "sage-light" (original off-policy-style)
+  method: sage-light
+  # For sage-light, Threshold for switching hint levels based on per-prompt rollout accuracy.
+  hint_accuracy_min_threshold: 0.0
+  hint_accuracy_max_threshold: 0.25
