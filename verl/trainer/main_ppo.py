@@ -113,6 +113,8 @@ class TaskRunner:
         mapping: Dictionary mapping Role enums to resource pool IDs for GPU allocation
     """
 
+    trainer_cls = RayPPOTrainer
+
     def __init__(self):
         self.role_worker_mapping = {}
         self.mapping = {}
@@ -320,7 +322,7 @@ class TaskRunner:
         train_sampler = create_rl_sampler(config.data, train_dataset)
 
         # Initialize the PPO trainer.
-        trainer = RayPPOTrainer(
+        trainer = self.trainer_cls(
             config=config,
             tokenizer=tokenizer,
             processor=processor,
