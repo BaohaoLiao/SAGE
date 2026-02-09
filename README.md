@@ -28,8 +28,22 @@ When signal loses for hard prompts during RL (all trajectories are wrong), LLM s
 
 ## 🌟 Overview
 
+<div align="center">
+<img alt="logo" src="assets/overview.png" width="400">
+</div>
+
+When an LLM can’t sample any correct trajectory for a hard prompt, the LLM self-generates hint from the reference solution of the prompt. The hint is then used together with the difficult prompt as input to the LLM, avoiding advantage collapse and ensuring the sampling of correct trajectories to update the policy model.
+
+<div align="center">
+<img alt="logo" src="assets/results.png" width="600">
+</div>
+
+
+
+
+
 ## 📦 Installation
-1. Create a new environmt
+1. Create a new environment
     ```bash
     python -m venv ~/.python/sage
     source ~/.python/sage/bin/activate
@@ -40,14 +54,14 @@ When signal loses for hard prompts during RL (all trajectories are wrong), LLM s
     ```
 2. Install dependencies
     ```bash
+    python -m uv pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu128
+    python -m uv pip install -U pip setuptools wheel packaging psutil
+    python -m uv pip install flash-attn==2.8.0.post2 --no-build-isolation
+
+
+    pip install flash-attn==2.8.0.post2 --no-build-isolation
+    pip install -r requirements.txt
     ```
-
-python -m uv pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu128
-python -m uv pip install -U pip setuptools wheel packaging psutil
-python -m uv pip install flash-attn==2.8.0.post2 --no-build-isolation
-
-pip install flash-attn==2.8.0.post2 --no-build-isolation
-pip install -r requirements.txt
 
 ## ⚡ Training
 1. Prepare training set
@@ -75,7 +89,7 @@ pip install -r requirements.txt
 
 ## 📝 Citation
 
-If you find SAGE useful, please cite:
+If you find SAGE useful, please cite as:
 
 ```bibtex
 @misc{liao2026selfhintinglanguagemodelsenhance,
