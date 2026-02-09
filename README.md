@@ -29,17 +29,27 @@ When signal loses for hard prompts during RL (all trajectories are wrong), LLM s
 ## 🌟 Overview
 
 <div align="center">
-<img alt="logo" src="assets/overview.png" width="400">
+<img alt="logo" src="assets/overview.png" width="500">
 </div>
 
 When an LLM can’t sample any correct trajectory for a hard prompt, the LLM self-generates hint from the reference solution of the prompt. The hint is then used together with the difficult prompt as input to the LLM, avoiding advantage collapse and ensuring the sampling of correct trajectories to update the policy model.
 
 <div align="center">
+<img alt="logo" src="assets/prompt_usage.png" width="400">
+</div>
+Without hint, some hard prompts are never used for GRPO, while SAGE increase the prompt usage rate, increaseing by 10% for the weaker LLM
+
+<div align="center">
 <img alt="logo" src="assets/results.png" width="800">
 </div>
 
+The usage of hard prompts during RL encourages LLM's exploration, leading to consistently better performance.
 
+<div align="center">
+<img alt="logo" src="assets/training_dynamics.png" width="800">
+</div>
 
+Among all methods, SAGE retain the on-policy property of GRPO, having a similar entropy scale. The learning from hard prompts promote exploration, with the response length growing steadily. 
 
 
 ## 📦 Installation
