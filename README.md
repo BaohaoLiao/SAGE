@@ -49,7 +49,7 @@ The usage of hard prompts during RL encourages LLM's exploration, leading to con
 <img alt="logo" src="assets/training_dynamics.png" width="800">
 </div>
 
-Among all methods, SAGE retain the on-policy property of GRPO, having a similar entropy scale. The learning from hard prompts promotes exploration, with the response length growing steadily for various LLMs.
+Among all methods, SAGE retains the on-policy property of GRPO, having a similar entropy scale. And the learning from hard prompts promotes exploration, with the response length growing steadily for various LLMs.
 
 
 ## 📦 Installation
@@ -101,6 +101,17 @@ Our code is based on verl. If you already have a verl environment, you can use i
     - SFT: We use [LUFFY's open-sourced code](https://github.com/ElliottYan/LUFFY) for SFT. The [training set](https://huggingface.co/datasets/baohao/luffy_train) is already preprocessed to LUFFY's style.
     - Scaf-GRPO: We use [Scaf-GRPO's open-sourced code](https://github.com/JIA-Lab-research/Scaf-GRPO). The [training set](https://huggingface.co/datasets/baohao/scaf-grpo_train) is already preprocessed to Scaf-GRPO's style.
 
+## 🤗 Trained Models
+
+| Model name | Link |
+| --- | --- |
+| SAGE_Llama_3.2-3B-Instruct | https://huggingface.co/baohao/SAGE_Llama-3.2-3B-Instruct |
+| SAGE-ligh_Llama-3.2-3B-Instruct | https://huggingface.co/baohao/SAGE-light_Llama-3.2-3B-Instruct  |
+| SAGE_Qwen2.5-7B-Instruct | https://huggingface.co/baohao/SAGE_Qwen2.5-7B-Instruct |
+| SAGE-light_Qwen2.5-7B-Instruct | https://huggingface.co/baohao/SAGE-light_Qwen2.5-7B-Instruct |
+| SAGE_Qwen3-4B-Instruct-2507 | https://huggingface.co/baohao/SAGE_Qwen3-4B-Instruct-2507 |
+| SAGE-light_Qwen3-4B-Instruct-2507 | https://huggingface.co/baohao/SAGE-light_Qwen3-4B-Instruct-2507 |
+
 ## 🎓 Evaluation
 ```bash
 bash scripts/eval.sh
@@ -123,3 +134,4 @@ If you find SAGE useful, please cite as:
 ```
 
 ## 🙏 Acknowledgments
+Our code is based on [verl](https://github.com/verl-project/verl) for training, [vllm](https://github.com/vllm-project/vllm) for sampling, and [oat](https://github.com/sail-sg/oat) for reponse grader. We really appreciate their contributions to the RL community.
