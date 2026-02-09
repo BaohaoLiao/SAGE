@@ -49,10 +49,11 @@ The usage of hard prompts during RL encourages LLM's exploration, leading to con
 <img alt="logo" src="assets/training_dynamics.png" width="800">
 </div>
 
-Among all methods, SAGE retain the on-policy property of GRPO, having a similar entropy scale. The learning from hard prompts promote exploration, with the response length growing steadily. 
+Among all methods, SAGE retain the on-policy property of GRPO, having a similar entropy scale. The learning from hard prompts promotes exploration, with the response length growing steadily for various LLMs.
 
 
 ## 📦 Installation
+Our code is based on verl. If you already have a verl environment, you can use it, and install the extra packages when prompting.
 1. Create a new environment
     ```bash
     python -m venv ~/.python/sage
@@ -64,13 +65,18 @@ Among all methods, SAGE retain the on-policy property of GRPO, having a similar 
     ```
 2. Install dependencies
     ```bash
+    pip install pip --upgrade
+    pip install uv
+
     python -m uv pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu128
     python -m uv pip install -U pip setuptools wheel packaging psutil
     python -m uv pip install flash-attn==2.8.0.post2 --no-build-isolation
 
-
-    pip install flash-attn==2.8.0.post2 --no-build-isolation
-    pip install -r requirements.txt
+    git clone https://github.com/BaohaoLiao/SAGE.git
+    cd ./SAGE
+    python -n uv pip install -r requirements.txt
+    python -m uv pip install -e .
+    python -m uv pip install vllm==0.10.1
     ```
 
 ## ⚡ Training
@@ -96,6 +102,9 @@ Among all methods, SAGE retain the on-policy property of GRPO, having a similar 
     - Scaf-GRPO: We use [Scaf-GRPO's open-sourced code](https://github.com/JIA-Lab-research/Scaf-GRPO). The [training set](https://huggingface.co/datasets/baohao/scaf-grpo_train) is already preprocessed to Scaf-GRPO's style.
 
 ## 🎓 Evaluation
+```bash
+bash scripts/eval.sh
+```
 
 ## 📝 Citation
 

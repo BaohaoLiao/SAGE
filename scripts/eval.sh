@@ -13,7 +13,7 @@ GPUS=(0 1 2 3 4 5 6 7)
 
 # Model and dataset arrays
 models=()
-for step in $(seq 400 50 500); do
+for step in $(seq 50 50 500); do
     models+=("${ckpts_dir}/global_step_${step}")
 done
 datasets=("aime24" "aime25" "amc23" "math500" "minerva_math" "olympiadbench" "gpqa" "mmlu_pro")
