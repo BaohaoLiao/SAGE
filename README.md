@@ -1,5 +1,5 @@
 <div align="center">
-<img alt="logo" src="assets/sage.png" width="400">
+<img alt="logo" src="assets/sage.png" width="600">
 
 <div align="center">
 
