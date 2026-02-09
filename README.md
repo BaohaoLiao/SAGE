@@ -5,7 +5,7 @@
 
 ## Self-Hinting Language Models Enhance Reinforcement Learning
 
-When signal loses for hard prompts during RL (all trajectories are wrong), LLM self-generates hint to help the sampling, improving both prompt usage and LLM performance.
+When signal is lost for hard prompts during RL (all trajectories are wrong), the LLM self-generates a hint to help sampling, improving both prompt usage and LLM performance.
 
 </div>
 
@@ -22,7 +22,7 @@ When signal loses for hard prompts during RL (all trajectories are wrong), LLM s
 
 ## 🔥 News
 
-- **[02/08/2026]** SAGE reproduction code is released! A [huggingface collection](https://huggingface.co/collections/baohao/sage) of dataset and models is also released.
+- **[02/08/2026]** SAGE reproduction code is released! A [huggingface collection](https://huggingface.co/collections/baohao/sage) of datasets and models is also released.
 - **[02/03/2026]** SAGE paper is released on [arXiv](https://www.arxiv.org/abs/2602.03143)!
 
 
@@ -32,12 +32,12 @@ When signal loses for hard prompts during RL (all trajectories are wrong), LLM s
 <img alt="logo" src="assets/overview.png" width="500">
 </div>
 
-When an LLM can’t sample any correct trajectory for a hard prompt, the LLM self-generates hint from the reference solution of the prompt. The hint is then used together with the difficult prompt as input to the LLM, avoiding advantage collapse and ensuring the sampling of correct trajectories to update the policy model.
+When an LLM can’t sample any correct trajectory for a hard prompt, the LLM self-generates a hint from the reference solution for the prompt. The hint is then used together with the difficult prompt as input to the LLM, avoiding advantage collapse and ensuring the sampling of correct trajectories to update the policy model.
 
 <div align="center">
 <img alt="logo" src="assets/prompt_usage.png" width="400">
 </div>
-Without hint, some hard prompts are never used for GRPO, while SAGE increase the prompt usage rate, increaseing by 10% for the weaker LLM
+Without a hint, some hard prompts are never used for GRPO, while SAGE increases the prompt usage rate by 10% for the weaker LLM.
 
 <div align="center">
 <img alt="logo" src="assets/results.png" width="800">
@@ -53,7 +53,7 @@ Among all methods, SAGE retains the on-policy property of GRPO, having a similar
 
 
 ## 📦 Installation
-Our code is based on verl. If you already have a verl environment, you can use it, and install the extra packages when prompting.
+Our code is based on verl. If you already have a verl environment, you can use it and install the extra packages when prompted.
 1. Create a new environment
     ```bash
     python -m venv ~/.python/sage
@@ -65,7 +65,7 @@ Our code is based on verl. If you already have a verl environment, you can use i
     ```
 2. Install dependencies
     ```bash
-    pip install pip --upgrade
+    pip install --upgrade pip
     pip install uv
 
     python -m uv pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu128
@@ -74,7 +74,7 @@ Our code is based on verl. If you already have a verl environment, you can use i
 
     git clone https://github.com/BaohaoLiao/SAGE.git
     cd ./SAGE
-    python -n uv pip install -r requirements.txt
+    python -m uv pip install -r requirements.txt
     python -m uv pip install -e .
     python -m uv pip install vllm==0.10.1
     ```
@@ -86,7 +86,7 @@ Our code is based on verl. If you already have a verl environment, you can use i
     bash scripts/prepare_data.sh
     ```
 
-2. Train with SAGE / SAGE-light. The key code locates in ```recipe/hint```.       
+2. Train with SAGE / SAGE-light. The key code is located in `recipe/hint`.
 
     ```bash
     bash scripts/run_sage.sh
@@ -106,7 +106,7 @@ Our code is based on verl. If you already have a verl environment, you can use i
 | Model name | Link |
 | --- | --- |
 | SAGE_Llama_3.2-3B-Instruct | https://huggingface.co/baohao/SAGE_Llama-3.2-3B-Instruct |
-| SAGE-ligh_Llama-3.2-3B-Instruct | https://huggingface.co/baohao/SAGE-light_Llama-3.2-3B-Instruct  |
+| SAGE-light_Llama-3.2-3B-Instruct | https://huggingface.co/baohao/SAGE-light_Llama-3.2-3B-Instruct  |
 | SAGE_Qwen2.5-7B-Instruct | https://huggingface.co/baohao/SAGE_Qwen2.5-7B-Instruct |
 | SAGE-light_Qwen2.5-7B-Instruct | https://huggingface.co/baohao/SAGE-light_Qwen2.5-7B-Instruct |
 | SAGE_Qwen3-4B-Instruct-2507 | https://huggingface.co/baohao/SAGE_Qwen3-4B-Instruct-2507 |
@@ -134,4 +134,4 @@ If you find SAGE useful, please cite as:
 ```
 
 ## 🙏 Acknowledgments
-Our code is based on [verl](https://github.com/verl-project/verl) for training, [vllm](https://github.com/vllm-project/vllm) for sampling, and [oat](https://github.com/sail-sg/oat) for reponse grader. We really appreciate their contributions to the RL community.
+Our code is based on [verl](https://github.com/verl-project/verl) for training, [vllm](https://github.com/vllm-project/vllm) for sampling, and [oat](https://github.com/sail-sg/oat) for response grader. We really appreciate their contributions to the RL community.
