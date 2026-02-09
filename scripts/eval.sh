@@ -81,7 +81,7 @@ for model_name in "${models[@]}"; do
         fi
 
         echo "Completed evaluation for ${model_name} on ${dataset}"
-        echo "Results saved to: ${output_dir}/record.txt"
+        echo "Results saved to: ${output_dir}/record_oat.txt"
         echo "----------------------------------------"
     done
 done
