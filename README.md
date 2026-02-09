@@ -35,7 +35,7 @@ When signal loses for hard prompts during RL (all trajectories are wrong), LLM s
 When an LLM can’t sample any correct trajectory for a hard prompt, the LLM self-generates hint from the reference solution of the prompt. The hint is then used together with the difficult prompt as input to the LLM, avoiding advantage collapse and ensuring the sampling of correct trajectories to update the policy model.
 
 <div align="center">
-<img alt="logo" src="assets/results.png" width="600">
+<img alt="logo" src="assets/results.png" width="800">
 </div>
 
 
