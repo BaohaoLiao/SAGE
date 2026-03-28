@@ -54,6 +54,9 @@ Among all methods, SAGE retains the on-policy property of GRPO, having a similar
 
 ## 📦 Installation
 Our code is based on verl. If you already have a verl environment, you can use it and install the extra packages when prompted.
+
+> **Note:** SAGE has been tested on NVIDIA B200 (Blackwell, sm_100) GPUs. If you use older GPUs (e.g., A100, H100), you may use `cu124` or `cu126` index URLs instead of `cu128`, and adjust the torch/vllm versions accordingly.
+
 1. Create a new environment
     ```bash
     python -m venv ~/.python/sage
@@ -63,20 +66,55 @@ Our code is based on verl. If you already have a verl environment, you can use i
     # conda create -n sage python==3.10
     # conda activate sage
     ```
-2. Install dependencies
+2. Install PyTorch and build tools
     ```bash
     pip install --upgrade pip
     pip install uv
 
     python -m uv pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu128
+    python -m uv pip install torchvision==0.23.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cu128
     python -m uv pip install -U pip setuptools wheel packaging psutil
+    ```
+3. Install flash-attn (compiled from source, may take ~10 minutes)
+    ```bash
     python -m uv pip install flash-attn==2.8.0.post2 --no-build-isolation
-
+    ```
+4. Install SAGE and dependencies
+    ```bash
     git clone https://github.com/BaohaoLiao/SAGE.git
     cd ./SAGE
     python -m uv pip install -r requirements.txt
     python -m uv pip install -e .
-    python -m uv pip install vllm==0.10.1
+    ```
+5. Install vllm (must match torch 2.8.0)
+    ```bash
+    python -m uv pip install vllm==0.10.2
+    ```
+6. Pin compatible transformers version
+
+    vllm may upgrade transformers to a version that removes `AutoModelForVision2Seq`. Pin it back:
+    ```bash
+    python -m uv pip install "transformers>=4.45.0,<4.54.0"
+    ```
+7. Rebuild flash-attn if torch was changed by vllm
+
+    If vllm modified the torch version, rebuild flash-attn:
+    ```bash
+    python -m uv pip install flash-attn==2.8.0.post2 --no-build-isolation --force-reinstall --no-cache-dir --no-deps
+    ```
+8. Install additional dependencies
+    ```bash
+    python -m uv pip install json5
+    ```
+9. Verify the installation
+    ```bash
+    python -c "
+    import torch; print('torch', torch.__version__)
+    from vllm import LLM, SamplingParams; print('vllm OK')
+    from flash_attn import flash_attn_func; print('flash-attn OK')
+    from transformers import AutoModelForVision2Seq; print('transformers OK')
+    x = torch.randn(2, 2, device='cuda'); print('CUDA OK:', torch.cuda.get_device_name())
+    "
     ```
 
 ## ⚡ Training
